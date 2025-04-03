@@ -2,14 +2,14 @@ import torch
 from swanlab.integration.transformers import SwanLabCallback
 from transformers import AutoTokenizer, TrainingArguments, Trainer, DefaultDataCollator
 from data.dataset import PretrainDataset
-from llama.model.llama_config import LMConfig
-from llama.model.llama import LlamaForCausalLM, GenerateTextCallback
+from model.llama_moe_mla import LlamaForCausalLM, GenerateTextCallback
+from model.llama_moe_mla_config import LMConfig
+
 
 
 def main():
 
-    output_dir = "llama_pretrain_hq_0325"
-
+    output_dir = "llama_moe_mla_pretrain_hq_0330"
     # 加载配置
     print("加载 config")
     config = LMConfig()
@@ -22,6 +22,7 @@ def main():
 
     print("初始化 others")
     model = LlamaForCausalLM(config)
+    model.load_state_dict(torch.load(r'D:\PycharmProjects\from scratch train llama\llama_moe_mla\final_model\llama_moe_mla_pretrain_hq_0330_state_dict.pth'), )
     print(model)
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Total number of parameters: {num_params / 1000 ** 3}B")
@@ -41,17 +42,17 @@ def main():
         do_eval=True,
         seed=42,
         per_device_train_batch_size=10,
-        per_device_eval_batch_size=10,
-        gradient_accumulation_steps=4,
+        per_device_eval_batch_size=30,
+        gradient_accumulation_steps=10,
         gradient_checkpointing=False,
-        num_train_epochs=2,
+        num_train_epochs=1,
         learning_rate=5e-4,
         warmup_ratio=0.03,
         weight_decay=0.1,
         lr_scheduler_type="cosine",
         save_strategy="steps",
         save_steps=100,
-        save_total_limit=1,
+        save_total_limit=2,
         eval_strategy="steps",
         eval_steps=5000,
         logging_steps=10,
@@ -61,7 +62,7 @@ def main():
 
     print("初始化 swanlab ")
     swanlab_callback = SwanLabCallback(
-        project="llama_from_scratch_pretrain",
+        project="llama_moe_mla_from_scratch_pretrain",
         experiment_name=output_dir,
         config={**config.__dict__, 'dataset': 'hq', 'train_data_num':len(train_set), 'val_data_num':len(val_set), "参数量":  f"{num_params / 1000 ** 3}B"}
     )
@@ -75,13 +76,13 @@ def main():
         data_collator=DefaultDataCollator(),
         callbacks=[
             swanlab_callback,
-            GenerateTextCallback(tokenizer, prefix="请帮我", generate_every=100, max_length=30),
+            GenerateTextCallback(tokenizer, prefix="我们要", generate_every=50, max_new_length=30),
         ]
     )
     print("Start Training...............")
-    trainer.train(resume_from_checkpoint=True)
-    torch.save(model.state_dict(), f"llama/llama_final_models/{output_dir}_state_dict.pth")
-    torch.save(model, f"llama/llama_final_models/{output_dir}.pth")
+    trainer.train(resume_from_checkpoint=False)
+    torch.save(model.state_dict(), f"./final_model/{output_dir}_state_dict.pth")
+    torch.save(model, f"./final_model/{output_dir}.pth")
 
 
 if __name__ == '__main__':

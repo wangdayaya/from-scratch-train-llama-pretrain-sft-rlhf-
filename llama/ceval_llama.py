@@ -88,7 +88,7 @@ if __name__ == '__main__':
 
         start = input_ids.shape[1]
         with torch.no_grad(), autocast():
-            outputs = model.generate(input_ids=input_ids, max_new_length=20, eos_token_id=tokenizer.eos_token_id)
+            outputs = model.generate(input_ids=input_ids, max_length=20, eos_token_id=tokenizer.eos_token_id)
         decoded = tokenizer.decode(outputs[0][start:], skip_special_tokens=True)
 
         answer = get_answer_by_qwen(f"文本：{decoded}\n上面的文本可能包含了选择题的答案 A、B、C、D 中的任意一个值，如果有请直接返回，不需要解释，如果没有则返回'没有答案'。")

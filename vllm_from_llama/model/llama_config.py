@@ -6,7 +6,6 @@ class LMConfig(PretrainedConfig):
 
     def __init__(
             self,
-
             flash_attention=True,
             vocab_size=6400,
             max_seq_len=512,
@@ -17,9 +16,9 @@ class LMConfig(PretrainedConfig):
             num_key_value_heads=4,
             rope_theta=1000000.0,
             rms_norm_eps=1e-06,
-
             # moe
             max_batch_size=10,
+            dropout=0.0,
             expert_num=4,
             topk=2,
             output_router_logits=False,
@@ -32,13 +31,14 @@ class LMConfig(PretrainedConfig):
             v_head_dim=32,
             **kwargs
     ):
-        self.flas_attention = flash_attention
+        self.flash_attention = flash_attention
         self.max_batch_size = max_batch_size
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.max_seq_len = max_seq_len
         self.vocab_size = vocab_size
+        self.dropout = dropout
         self.expert_num = expert_num
         self.topk = topk
         self.output_router_logits = output_router_logits

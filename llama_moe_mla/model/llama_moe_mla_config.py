@@ -6,8 +6,7 @@ class LMConfig(PretrainedConfig):
 
     def __init__(
             self,
-
-            flash_attention=False,
+            flas_attention=False,
             vocab_size=6400,
             max_seq_len=512,
             hidden_size=512,
@@ -17,33 +16,33 @@ class LMConfig(PretrainedConfig):
             num_key_value_heads=4,
             rope_theta=1000000.0,
             rms_norm_eps=1e-06,
+
             # moe
-            max_batch_size=10,
-            dropout=0.0,
             expert_num=4,
             topk=2,
-            output_router_logits=False,
+            output_router_logits=True,
             aux_loss_coef=0.01,
+            shared_expert=True,
+
             # mla
-            q_lora_rank=128,
-            kv_lora_rank=128,
-            qk_nope_head_dim=16,
-            qk_rope_head_dim=16,
-            v_head_dim=32,
+            q_lora_rank=64,
+            kv_lora_rank=64,
+            qk_nope_head_dim=32,
+            qk_rope_head_dim=32,
+            v_head_dim=64,
             **kwargs
     ):
-        self.flas_attention = flash_attention
-        self.max_batch_size = max_batch_size
+        self.flas_attention = flas_attention
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.max_seq_len = max_seq_len
         self.vocab_size = vocab_size
-        self.dropout = dropout
         self.expert_num = expert_num
         self.topk = topk
         self.output_router_logits = output_router_logits
         self.aux_loss_coef = aux_loss_coef
+        self.shared_expert = shared_expert
 
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank

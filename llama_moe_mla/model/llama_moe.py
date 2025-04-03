@@ -1,5 +1,5 @@
 import math
-
+from flash_attn import flash_attn_func
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -8,51 +8,37 @@ from transformers import PreTrainedModel, AutoTokenizer, TrainerCallback, Traine
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
-class RMSNorm(torch.nn.Module):
-    def __init__(self, hidden_size, eps):
+@torch.no_grad()
+def llama_rotary_embedding(length, config):
+    inv_freq = torch.arange(0, config.head_dim, 2) / config.head_dim
+    inv_freq = 1 / (config.rope_theta ** inv_freq)
+    inv_freq = inv_freq.reshape(config.head_dim // 2, 1)
+
+    position_ids = torch.arange(length).reshape(1, length).float()
+    freq = inv_freq.matmul(position_ids).transpose(0, 1)
+    emb = torch.cat((freq, freq), -1)
+    return emb.cos(), emb.sin()
+
+
+def apply_rotary_pos_emb(x, cos, sin, config):
+    def rotate_half(x):
+        left = x[..., :config.head_dim // 2]
+        right = -x[..., config.head_dim // 2:]
+        return torch.cat((right, left), -1)
+
+    return x * cos + rotate_half(x) * sin
+
+
+class LlamaRMSNorm(torch.nn.Module):
+    def __init__(self, config):
         super().__init__()
-        self.rms_norm_eps = eps
-        self.weight = torch.nn.Parameter(torch.ones(hidden_size))
+        self.rms_norm_eps = config.rms_norm_eps
+        self.weight = torch.nn.Parameter(torch.ones(config.hidden_size))
 
     def forward(self, x):
         var = x.pow(2).mean(-1, keepdim=True)
         x = x * (var + self.rms_norm_eps).rsqrt()
         return self.weight * x
-
-
-def rotate_half(x):
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotate_pos_emb(q, k, cos, sin, unsqueeze_dim=2):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-
-    return q_embed, k_embed
-
-
-# 旋转位置编码
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_seq_len=1024):
-        super(RotaryEmbedding, self).__init__()
-        self.dim = dim
-        self.max_seq_len = max_seq_len
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        t = torch.arange(max_seq_len).float().unsqueeze(1)
-        freqs = t @ inv_freq.unsqueeze(0)
-        freqs = torch.cat((freqs, freqs), dim=-1)
-
-        self.register_buffer("cos_cached", freqs.cos())
-        self.register_buffer("sin_cached", freqs.sin())
-
-    def forward(self, q, k):
-        cos = self.cos_cached[:q.shape[1], :].unsqueeze(0)
-        sin = self.sin_cached[:q.shape[1], :].unsqueeze(0)
-        return apply_rotate_pos_emb(q, k, cos, sin)
 
 
 def get_causal_mask(attention_mask):
@@ -67,89 +53,55 @@ def get_causal_mask(attention_mask):
     return causal_mask
 
 
-class MLA(nn.Module):
+class LlamaAttention(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.hidden_size = config.hidden_size  # 隐藏层维度
-        self.num_attention_heads = config.num_attention_heads  # 总头数
-        self.q_lora_rank = config.q_lora_rank  # q低秩压缩到的维度
-        self.kv_lora_rank = config.kv_lora_rank  # kv低秩压缩到的维度
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim  # qk的总维度，不带旋转位置编码的维度加上带旋转位置编码的维度
-        self.v_head_dim = config.v_head_dim  # value的维度，等于不带旋转位置编码的k维度
-        self.max_seq_len = config.max_seq_len
-        self.max_batch_size = config.max_batch_size
+        self.config = config
+        self.q_proj = torch.nn.Linear(config.hidden_size, config.num_attention_heads * config.head_dim, bias=False)
+        self.k_proj = torch.nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
+        self.v_proj = torch.nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
+        self.o_proj = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
 
-        self.wq_a = nn.Linear(self.hidden_size, self.q_lora_rank)  # q 的降维矩阵
-        self.q_norm = RMSNorm(self.q_lora_rank, config.rms_norm_eps)
-        self.wq_b = nn.Linear(self.q_lora_rank, self.num_attention_heads * self.qk_head_dim)  # q的升维矩阵
+    def forward(self, hidden_state, attention_mask):
+        B, L, _ = hidden_state.shape
+        cos, sin = llama_rotary_embedding(L, self.config)
+        cos, sin = cos.to(hidden_state.device), sin.to(hidden_state.device)
 
-        self.wkv_a = nn.Linear(self.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim)  # kv的降维矩阵
-        self.kv_norm = RMSNorm(self.kv_lora_rank, config.rms_norm_eps)
-        self.wkv_b = nn.Linear(self.kv_lora_rank,
-                               self.num_attention_heads * (self.qk_nope_head_dim + self.v_head_dim))  # kv的升维矩阵
+        q = self.q_proj(hidden_state)
+        k = self.k_proj(hidden_state)
+        v = self.v_proj(hidden_state)
 
-        self.wo = nn.Linear(self.num_attention_heads * self.v_head_dim, self.hidden_size)
+        q = q.view(B, L, self.config.num_attention_heads, self.config.head_dim).transpose(1, 2)
+        k = k.view(B, L, self.config.num_key_value_heads, self.config.head_dim).transpose(1, 2)
+        v = v.view(B, L, self.config.num_key_value_heads, self.config.head_dim).transpose(1, 2)
 
-        self.rotary_emb = RotaryEmbedding(self.qk_rope_head_dim, config.max_seq_len)  # 旋转旋转位置编码
-        self.register_buffer('kv_cache', torch.zeros(self.max_batch_size, self.max_seq_len, self.kv_lora_rank),
-                             persistent=False)
-        self.register_buffer('pe_cache', torch.zeros(self.max_batch_size, self.max_seq_len, self.qk_rope_head_dim),
-                             persistent=False)
+        q = apply_rotary_pos_emb(q, cos, sin, self.config)
+        k = apply_rotary_pos_emb(k, cos, sin, self.config)
 
-    def forward(self, x, mask=None):
-        bs, seq_len, _ = x.shape
-        q = self.wq_a(x)  # [bs, seq_len, q_lora_rank]
-        q = self.q_norm(q)  # [bs, seq_len, q_lora_rank]
-        q = self.wq_b(q)  # [bs, seq_len, n_heads * qk_head_dim]
-        q = q.view(bs, seq_len, self.num_attention_heads, self.qk_head_dim)  # [bs, seq_len, n_heads, qk_head_dim]
-        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim],
-                                   dim=-1)  # q_nope shape:[bs, seq_len, n_heads, qk_nope_head_dim] q_pe shape:[bs, seq_len, n_heads, qk_rope_head_dim]
+        if self.config.flas_attention:
+            q = q.transpose(1, 2).type_as(v)
+            k = k.transpose(1, 2).type_as(v)
+            v = v.transpose(1, 2).type_as(v)
+            attn = flash_attn_func(q, k, v, causal=True)
+            attn = attn.view(B, L, -1)
+        else:
+            k = k.unsqueeze(2).repeat(1, 1, self.config.num_attention_heads // self.config.num_key_value_heads, 1,
+                                      1).reshape(B, -1, L, self.config.head_dim)
+            v = v.unsqueeze(2).repeat(1, 1, self.config.num_attention_heads // self.config.num_key_value_heads, 1,
+                                      1).reshape(B, -1, L, self.config.head_dim)
 
-        kv = self.wkv_a(x)  # [bs, seq_len, kv_lora_rank + qk_rope_head_dim]
-        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim],
-                               dim=-1)  # kv shape:[bs, seq_len, kv_lora_rank] k_pe shape:[bs, seq_len, qk_rope_head_dim]
-        kv = self.kv_norm(kv)
+            attn = q @ k.transpose(-2, -1) / math.sqrt(self.config.head_dim)
+            attn = attn + get_causal_mask(attention_mask)
+            attn = F.softmax(attn.float(), dim=-1).type_as(q)
+            attn = attn @ v
+            attn = attn.transpose(1, 2).reshape(B, L, -1)
 
-        k_pe = k_pe.unsqueeze(2)
-        q_pe, k_pe = self.rotary_emb(q_pe,
-                                     k_pe)  # [bs, seq_len, n_heads, qk_rope_head_dim]  [bs, seq_len, 1, qk_rope_head_dim]
-        k_pe = k_pe.squeeze(2)  # [bs, seq_len, qk_rope_head_dim]
-        self.kv_cache[:bs, :seq_len, :].copy_(kv.detach())  # kv shape:[bs, seq_len, kv_lora_rank]
-        self.pe_cache[:bs, :seq_len, :].copy_(k_pe.detach())  # k_pe shape:[bs, seq_len, qk_rope_head_dim]
-
-        wkv_b = self.wkv_b.weight  # [n_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
-        wkv_b = wkv_b.view(self.num_attention_heads, -1,
-                           self.kv_lora_rank)  # [n_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank]
-        q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:,
-                                                        :self.qk_nope_head_dim])  # [bs, seq_len, n_heads, qk_nope_head_dim] * [n_heads, qk_nope_head_dim, kv_lora_rank]=[bs, seq_len, n_heads, kv_lora_rank]
-        scores_nope = torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bs, :seq_len,
-                                                             :])  # [bs, seq_len, n_heads, kv_lora_rank] *[bs, seq_len, kv_lora_rank]= [bs, seq_len, n_heads, seq_len]
-        scores_pe = torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bs, :seq_len,
-                                                         :])  # [bs, seq_len, n_heads, qk_rope_head_dim] *  [bs, seq_len, qk_rope_head_dim] =  [bs, seq_len, n_heads, seq_len]
-        scores = (scores_nope + scores_pe) / math.sqrt(
-            self.qk_nope_head_dim + self.qk_rope_head_dim)  # [bs, seq_len, n_heads, seq_len]
-        if mask is not None:
-            mask = get_causal_mask(mask).squeeze(1)  # [bs, 1, seq_len, seq_len] -》[bs, seq_len, seq_len]
-            scores += mask.unsqueeze(2)
-
-        scores = scores.softmax(dim=-1)
-        x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bs,
-                                                   :seq_len])  # [bs, seq_len, n_heads, seq_len]x[bs, seq_len, kv_lora_rank]=[bs, seq_len, n_heads, kv_lora_rank]
-        x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:,
-                                              -self.v_head_dim:])  # [bs, seq_len, n_heads, kv_lora_rank] x  [n_heads, v_head_dim, kv_lora_rank] = [bs, seq_len, n_heads, v_head_dim]
-        x = x.contiguous().view(bs, seq_len, -1)  # [bs, seq_len, n_heads, v_head_dim] [bs, seq_len, n_heads*v_head_dim]
-        x = self.wo(x)
-        return x
+        attn = self.o_proj(attn)
+        return attn
 
 
-def load_balancing_loss_func(
-        gate_logits,
-        num_experts,
-        top_k):
-    concatenated_gate_logits = torch.cat([layer_gate for layer_gate in gate_logits],
-                                         dim=0)  # 各个层的gate_logit进行合并[layers X batch_size X sequence_length, num_experts]
+def load_balancing_loss_func(gate_logits, num_experts, top_k):
+    concatenated_gate_logits = torch.cat([layer_gate for layer_gate in gate_logits], dim=0)  # 各个层的gate_logit进行合并[layers X batch_size X sequence_length, num_experts]
     routing_weights = F.softmax(concatenated_gate_logits, dim=-1)
     _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
     expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
@@ -204,6 +156,8 @@ class MoE(nn.Module):
         self.config = config
         self.experts = nn.ModuleList([Expert(config) for _ in range(config.expert_num)])
         self.gating = Gating(config)
+        if self.config.shared_expert is not None:
+            self.shared_experts = Expert(config)
 
     def forward(self, x):
         sparse_logits, indices, gate_logit = self.gating(x)
@@ -220,17 +174,18 @@ class MoE(nn.Module):
                 gate_scores = sparse_logits_flat[expert_mask_flat, i].unsqueeze(1)  # (seq_true) --> (seq_true, 1)
                 weighted_output = export_output * gate_scores  # (seq_true, dim)
                 final_outputs[expert_mask] += weighted_output
-
+        if self.config.shared_expert:
+            final_outputs = final_outputs + self.shared_experts(x)
         return final_outputs, gate_logit
 
 
 class LlamaDecoderLayer(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.self_attn = MLA(config)
+        self.self_attn = LlamaAttention(config)
         self.moe = MoE(config)
-        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.input_layernorm = LlamaRMSNorm(config)
+        self.post_attention_layernorm = LlamaRMSNorm(config)
 
     def forward(self, hidden_state, attention_mask):
         res = hidden_state
@@ -255,11 +210,11 @@ class LlamaForCausalLM(PreTrainedModel):
 
         self.embed_tokens = torch.nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = torch.nn.ModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.norm = LlamaRMSNorm(config)
         self.lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.gradient_checkpointing = False
 
-    def forward(self, input_ids, attention_mask, labels=None):
+    def forward(self, input_ids, attention_mask=None, labels=None):
 
         all_router_logits = () if self.config.output_router_logits else None
 
@@ -276,16 +231,15 @@ class LlamaForCausalLM(PreTrainedModel):
 
         if labels is not None:
             logits = self.lm_head(hidden_states)
-            self.loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=0)
+            self.loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), reduction='none').view(labels.size())
+            self.loss = (self.loss * attention_mask).sum() / attention_mask.sum()
         else:
             logits = self.lm_head(hidden_states[:, [-1], :])
             self.loss = None
 
-        if self.config.output_router_logits:
+        if self.config.output_router_logits and labels is not None:
             self.aux_loss = load_balancing_loss_func(all_router_logits, self.expert_num, self.topk)
-
-            if labels is not None:
-                self.loss += self.config.aux_loss_coef * self.aux_loss.to(self.loss.device)
+            self.loss += self.config.aux_loss_coef * self.aux_loss.to(self.loss.device)
 
         return CausalLMOutputWithPast(self.loss, logits)
 
@@ -296,9 +250,10 @@ class LlamaForCausalLM(PreTrainedModel):
         self.gradient_checkpointing = False
 
     @torch.inference_mode
-    def generate(self, input_ids, eos_token_id, max_new_length=10, temperature=0.0, top_k=50, top_p=0.95,
+    def generate(self, input_ids, eos_token_id, max_new_length=10, temperature=0.8, top_k=50, top_p=0.95,
                  repetition_penalty=1., ):
-        while input_ids.shape[1] < input_ids.shape[1] + max_new_length - 1:
+        old = input_ids.shape[1]
+        while input_ids.shape[1] < min(old + max_new_length, self.config.max_seq_len) - 1:
             inference_res = self(input_ids)
             logits = inference_res.logits  # [b, s, d]
             logits = logits[:, -1, :]  # [b, d]
@@ -321,11 +276,11 @@ class LlamaForCausalLM(PreTrainedModel):
 
 
 class GenerateTextCallback(TrainerCallback):
-    def __init__(self, tokenizer, prefix="我是", generate_every=500, max_length=50):
+    def __init__(self, tokenizer, prefix="我是", generate_every=500, max_new_length=50):
         self.tokenizer = tokenizer
         self.prefix = prefix
         self.generate_every = generate_every
-        self.max_length = max_length
+        self.max_new_length = max_new_length
 
     def on_step_end(self, args, state: TrainerState, control: TrainerControl, model=None, **kwargs):
         if state.global_step % self.generate_every == 0:
@@ -333,7 +288,7 @@ class GenerateTextCallback(TrainerCallback):
             input_ids = self.tokenizer(self.tokenizer.bos_token + self.prefix, return_tensors="pt")["input_ids"].to(
                 model.device)
             with torch.no_grad():
-                outputs = model.generate(input_ids=input_ids, max_new_length=self.max_length,
+                outputs = model.generate(input_ids=input_ids, max_new_length=self.max_new_length,
                                          eos_token_id=self.tokenizer.eos_token_id, )
             decode = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             print(f"Step {state.global_step}: Generated text: {decode}")
@@ -341,11 +296,11 @@ class GenerateTextCallback(TrainerCallback):
 
 
 class ChatCallback(TrainerCallback):
-    def __init__(self, tokenizer, prompt="请帮我写一个关于小狗的故事", generate_every=500, max_length=50):
+    def __init__(self, tokenizer, prompt="请帮我写一个关于小狗的故事", generate_every=500, max_new_length=50):
         self.tokenizer = tokenizer
         self.prompt = prompt
         self.generate_every = generate_every
-        self.max_length = max_length
+        self.max_new_length = max_new_length
 
     def on_step_end(self, args, state: TrainerState, control: TrainerControl, model=None, **kwargs):
         messages = [{"role": 'user', "content": self.prompt}]
@@ -354,7 +309,7 @@ class ChatCallback(TrainerCallback):
         if state.global_step % self.generate_every == 0:
             model.eval()
             with torch.no_grad():
-                outputs = model.generate(input_ids=input_ids, max_new_length=self.max_length,
+                outputs = model.generate(input_ids=input_ids, max_length=self.max_new_length,
                                          eos_token_id=self.tokenizer.eos_token_id, )
             decode = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             print(f"Step {state.global_step}: Generated text: {decode}")

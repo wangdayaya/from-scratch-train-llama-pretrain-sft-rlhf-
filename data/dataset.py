@@ -2,6 +2,9 @@ import json
 from torch.utils.data import Dataset
 import numpy as np
 import torch
+from PIL import Image
+
+from vllm_from_llama.model.vlm import VLM
 
 
 class PretrainDataset(Dataset):
@@ -155,8 +158,10 @@ class DPODataset(Dataset):
         chosen_prompt = self.tokenizer.apply_chat_template(chosen, tokenize=False, add_generation_prompt=False)
         rejected_prompt = self.tokenizer.apply_chat_template(rejected, tokenize=False, add_generation_prompt=False)
 
-        chosen_encoding = self.tokenizer(chosen_prompt, truncation=True, max_length=self.max_seq_len, padding='max_length')
-        rejected_encoding = self.tokenizer(rejected_prompt, truncation=True, max_length=self.max_seq_len, padding='max_length')
+        chosen_encoding = self.tokenizer(chosen_prompt, truncation=True, max_length=self.max_seq_len,
+                                         padding='max_length')
+        rejected_encoding = self.tokenizer(rejected_prompt, truncation=True, max_length=self.max_seq_len,
+                                           padding='max_length')
 
         chosen_input_ids = chosen_encoding['input_ids']
         chosen_loss_mask = self._generate_loss_mask(chosen_input_ids)
@@ -212,4 +217,87 @@ class DPODataCollator:
             "input_ids": torch.tensor(input_ids, dtype=torch.int64),
             "labels": torch.tensor(labels, dtype=torch.int64),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.int64)
+        }
+
+
+class VLMDataset(Dataset):
+    def __init__(self, jsonl_path, images_path, tokenizer, preprocess=None, max_seq_len=512,
+                 image_special_token='@' * 196):
+
+        super().__init__()
+        self.samples = self.load_data(jsonl_path)
+        self.images_path = images_path
+
+        self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len
+        self.preprocess = preprocess
+        self.image_token = image_special_token
+        self.bos_id = tokenizer('<s>assistant\n', add_special_tokens=False).input_ids
+        self.eos_id = tokenizer('</s>\n', add_special_tokens=False).input_ids
+
+    def __len__(self):
+        return len(self.samples)
+
+    def load_data(self, path):
+        samples = []
+        with open(path, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                data = json.loads(line.strip())
+                samples.append(data)
+        return samples
+
+    def _create_chat_prompt(self, conversations):
+        messages = []
+        for i, turn in enumerate(conversations):
+            role = 'user' if i % 2 == 0 else 'assistant'
+            messages.append({"role": role, "content": turn['content'].replace('<image>', self.image_token)})
+        return self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False
+        )
+
+    def _generate_loss_mask(self, input_ids):
+        loss_mask = [0] * len(input_ids)
+        i = 0
+        while i < len(input_ids):
+            if input_ids[i:i + len(self.bos_id)] == self.bos_id:
+                start = i + len(self.bos_id)
+                end = start
+                while end < len(input_ids):
+                    if input_ids[end:end + len(self.eos_id)] == self.eos_id:
+                        break
+                    end += 1
+                # 将"真实答案部分+</s>"部分设置 1 ，其他都是 0 ，例如：球迷在比赛的第八局击球时,因运动队得分的次数而干扰球的次数</s>
+                for j in range(start + 1, min(end + len(self.eos_id) + 1, self.max_seq_len)):
+                    loss_mask[j] = 1
+                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
+            else:
+                i += 1
+        return loss_mask
+
+    def __getitem__(self, index: int):
+        sample = self.samples[index]
+        image_paths = sample['image']
+        prompt = self._create_chat_prompt(sample['conversations'])
+        input_ids = self.tokenizer(prompt, truncation=True, max_length=self.max_seq_len, padding='max_length')['input_ids']
+        loss_mask = self._generate_loss_mask(input_ids)
+
+        X = torch.tensor(input_ids[:-1], dtype=torch.long)
+        Y = torch.tensor(input_ids[1:], dtype=torch.long)
+        loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)
+
+        pixel_tensors = []
+        for image_name in image_paths.split(','):
+            image_name = image_name.strip()
+            image = Image.open(f'{self.images_path}/{image_name}')
+            image_tensor = VLM.image2tensor(image, self.preprocess)  # 【1，3，224，224】
+            pixel_tensors.append(image_tensor)
+        pixel_tensors = torch.stack(pixel_tensors, dim=0)  # 【b，1，3，224，224】
+
+        return {
+            "input_ids": X,  # 【max_seq_len，】
+            "labels": Y,  # 【max_seq_len，】
+            "attention_mask": loss_mask,  # 【max_seq_len，】
+            "pixel_tensors": pixel_tensors   # 【b，1，3，224，224】
         }
