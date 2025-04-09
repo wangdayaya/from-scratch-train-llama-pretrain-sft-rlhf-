@@ -1,8 +1,11 @@
 import math
+import random
+
 from flash_attn import flash_attn_func
 import torch
 import torch.nn.functional as F
-from torch import nn
+from torch import nn, no_grad
+from torch.cuda.amp import autocast
 from torch.utils.checkpoint import checkpoint
 from transformers import PreTrainedModel, AutoTokenizer, TrainerCallback, TrainerState, TrainerControl
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -62,7 +65,7 @@ class LlamaAttention(torch.nn.Module):
         self.v_proj = torch.nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
         self.o_proj = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
 
-    def forward(self, hidden_state, attention_mask):
+    def forward(self, hidden_state):
         B, L, _ = hidden_state.shape
         cos, sin = llama_rotary_embedding(L, self.config)
         cos, sin = cos.to(hidden_state.device), sin.to(hidden_state.device)
@@ -78,7 +81,7 @@ class LlamaAttention(torch.nn.Module):
         q = apply_rotary_pos_emb(q, cos, sin, self.config)
         k = apply_rotary_pos_emb(k, cos, sin, self.config)
 
-        if self.config.flas_attention:
+        if self.config.flash_attention:
             q = q.transpose(1, 2).type_as(v)
             k = k.transpose(1, 2).type_as(v)
             v = v.transpose(1, 2).type_as(v)
@@ -91,7 +94,9 @@ class LlamaAttention(torch.nn.Module):
                                       1).reshape(B, -1, L, self.config.head_dim)
 
             attn = q @ k.transpose(-2, -1) / math.sqrt(self.config.head_dim)
-            attn = attn + get_causal_mask(attention_mask)
+            mask = torch.full((1, 1, self.config.max_seq_len, self.config.max_seq_len), float("-inf"))
+            mask = torch.triu(mask, diagonal=1)
+            attn += mask[:, :, :L, :L].to(attn.device)
             attn = F.softmax(attn.float(), dim=-1).type_as(q)
             attn = attn @ v
             attn = attn.transpose(1, 2).reshape(B, L, -1)
@@ -187,10 +192,10 @@ class LlamaDecoderLayer(torch.nn.Module):
         self.input_layernorm = LlamaRMSNorm(config)
         self.post_attention_layernorm = LlamaRMSNorm(config)
 
-    def forward(self, hidden_state, attention_mask):
+    def forward(self, hidden_state):
         res = hidden_state
         hidden_state = self.input_layernorm(hidden_state)
-        hidden_state = self.self_attn(hidden_state, attention_mask) + res
+        hidden_state = self.self_attn(hidden_state) + res
         res = hidden_state
         hidden_state = self.post_attention_layernorm(hidden_state)
         hidden_states, gate_logit = self.moe(hidden_state)
@@ -221,9 +226,9 @@ class LlamaForCausalLM(PreTrainedModel):
         hidden_states = self.embed_tokens(input_ids)
         for idx, layer in enumerate(self.layers):
             if self.gradient_checkpointing and self.training:
-                hidden_states, gate_logit = checkpoint(layer, hidden_states, attention_mask)
+                hidden_states, gate_logit = checkpoint(layer, hidden_states)
             else:
-                hidden_states, gate_logit = layer(hidden_states, attention_mask)
+                hidden_states, gate_logit = layer(hidden_states)
             if gate_logit is not None and all_router_logits is not None:
                 all_router_logits += (gate_logit,)
 
@@ -276,16 +281,16 @@ class LlamaForCausalLM(PreTrainedModel):
 
 
 class GenerateTextCallback(TrainerCallback):
-    def __init__(self, tokenizer, prefix="我是", generate_every=500, max_new_length=50):
+    def __init__(self, tokenizer, generate_every=500, max_new_length=50):
         self.tokenizer = tokenizer
-        self.prefix = prefix
         self.generate_every = generate_every
         self.max_new_length = max_new_length
 
     def on_step_end(self, args, state: TrainerState, control: TrainerControl, model=None, **kwargs):
         if state.global_step % self.generate_every == 0:
             model.eval()
-            input_ids = self.tokenizer(self.tokenizer.bos_token + self.prefix, return_tensors="pt")["input_ids"].to(
+            prefix = ["请帮助我", "写一首", "给我一些", "你知道"]
+            input_ids = self.tokenizer(self.tokenizer.bos_token + random.choice(prefix), return_tensors="pt")["input_ids"].to(
                 model.device)
             with torch.no_grad():
                 outputs = model.generate(input_ids=input_ids, max_new_length=self.max_new_length,
@@ -296,21 +301,40 @@ class GenerateTextCallback(TrainerCallback):
 
 
 class ChatCallback(TrainerCallback):
-    def __init__(self, tokenizer, prompt="请帮我写一个关于小狗的故事", generate_every=500, max_new_length=50):
+    def __init__(self, tokenizer, generate_every=500, max_new_length=50):
         self.tokenizer = tokenizer
-        self.prompt = prompt
         self.generate_every = generate_every
         self.max_new_length = max_new_length
 
     def on_step_end(self, args, state: TrainerState, control: TrainerControl, model=None, **kwargs):
-        messages = [{"role": 'user', "content": self.prompt}]
+        prompt = ["请帮我写一个关于小狗的故事", "给我健身建议","介绍杭州的热门景区"]
+        messages = [{"role": 'user', "content": random.choice(prompt)}]
         new_prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
         input_ids = torch.tensor(self.tokenizer(new_prompt)['input_ids'], device=model.device).unsqueeze(0)
         if state.global_step % self.generate_every == 0:
             model.eval()
             with torch.no_grad():
-                outputs = model.generate(input_ids=input_ids, max_length=self.max_new_length,
+                outputs = model.generate(input_ids=input_ids, max_new_length=self.max_new_length,
                                          eos_token_id=self.tokenizer.eos_token_id, )
             decode = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             print(f"Step {state.global_step}: Generated text: {decode}")
             model.train()
+
+# if __name__ == '__main__':
+#     # 测试标准注意力计算方式和 flash_attention 的结果是否一样
+#     device = torch.device("cuda")
+#     hidden_state = torch.randn(1, 100, 512).to(device)
+#
+#     config = LMConfig()
+#     tokenizer = AutoTokenizer.from_pretrained(r"D:\minimind\model\minimind_tokenizer")
+#     config.vocab_size = len(tokenizer)
+#     model = LlamaAttention(config).to(device)
+#
+#     with autocast(), no_grad():
+#         attn_standard = model(hidden_state, flash=False)
+#         print(attn_standard)
+#         attn_flash = model(hidden_state, flash=True)
+#         print(attn_flash)
+#
+#     diff = torch.abs(attn_flash - attn_standard).mean()
+#     print("Mean Absolute Difference:", diff.item())

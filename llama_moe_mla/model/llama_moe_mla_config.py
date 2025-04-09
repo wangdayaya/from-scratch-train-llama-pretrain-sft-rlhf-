@@ -6,7 +6,7 @@ class LMConfig(PretrainedConfig):
 
     def __init__(
             self,
-            flas_attention=False,
+            flash_attention=False,
             vocab_size=6400,
             max_seq_len=512,
             hidden_size=512,
@@ -32,7 +32,7 @@ class LMConfig(PretrainedConfig):
             v_head_dim=64,
             **kwargs
     ):
-        self.flas_attention = flas_attention
+        self.flash_attention = flash_attention
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads

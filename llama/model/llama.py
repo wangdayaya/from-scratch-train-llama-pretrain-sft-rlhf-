@@ -170,7 +170,7 @@ class LlamaForCausalLM(PreTrainedModel):
         self.gradient_checkpointing = False
 
     @torch.inference_mode
-    def generate(self, input_ids, eos_token_id, max_new_length=10, temperature=0.0, top_k=50, top_p=0.95, repetition_penalty=1., ):
+    def generate(self, input_ids, eos_token_id, max_new_length=10, temperature=0.8, top_k=50, top_p=0.95, repetition_penalty=1., ):
         old = input_ids.shape[1]
         while input_ids.shape[1] < min(old + max_new_length, self.config.max_seq_len) - 1:
             inference_res = self(input_ids)

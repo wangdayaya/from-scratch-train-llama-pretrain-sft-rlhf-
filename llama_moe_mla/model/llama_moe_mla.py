@@ -1,4 +1,6 @@
 import math
+import random
+
 from flash_attn import flash_attn_func
 import torch
 import torch.nn.functional as F
@@ -124,6 +126,7 @@ def get_causal_mask(attention_mask):
 class MLA(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
         self.hidden_size = config.hidden_size  # 隐藏层维度
         self.num_attention_heads = config.num_attention_heads  # 总头数
         self.q_lora_rank = config.q_lora_rank  # q低秩压缩到的维度
@@ -147,7 +150,7 @@ class MLA(nn.Module):
 
         self.rotary_emb = RotaryEmbedding(self.qk_rope_head_dim, config.max_seq_len)  # 旋转旋转位置编码
 
-    def forward(self, x, mask):
+    def forward(self, x):
         bs, seq_len, _ = x.shape
         q = self.wq_a(x)  # [bs, seq_len, q_lora_rank]
         q = self.q_norm(q)  # [bs, seq_len, q_lora_rank]
@@ -173,9 +176,11 @@ class MLA(nn.Module):
         scores_nope = torch.einsum("bshc,btc->bsht", q_nope, kv)  # [bs, seq_len, n_heads, kv_lora_rank] *[bs, seq_len, kv_lora_rank]= [bs, seq_len, n_heads, seq_len]
         scores_pe = torch.einsum("bshr,btr->bsht", q_pe, k_pe)  # [bs, seq_len, n_heads, qk_rope_head_dim] *  [bs, seq_len, qk_rope_head_dim] =  [bs, seq_len, n_heads, seq_len]
         scores = (scores_nope + scores_pe) / math.sqrt( self.qk_nope_head_dim + self.qk_rope_head_dim)  # [bs, seq_len, n_heads, seq_len]
-        if mask is not None:
-            mask = get_causal_mask(mask).squeeze(1)  # [bs, 1, seq_len, seq_len] -》[bs, seq_len, seq_len]
-            scores += mask.unsqueeze(2)
+
+        mask = torch.full((1, 1, self.config.max_seq_len, self.config.max_seq_len), float("-inf"))
+        mask = torch.triu(mask, diagonal=1)
+        mask = mask[:, :, :seq_len, :seq_len].transpose(1, 2).to(scores.device)
+        scores += mask
 
         scores = scores.softmax(dim=-1)
         x = torch.einsum("bsht,btc->bshc", scores, kv)  # [bs, seq_len, n_heads, seq_len]x[bs, seq_len, kv_lora_rank]=[bs, seq_len, n_heads, kv_lora_rank]
@@ -278,10 +283,10 @@ class LlamaDecoderLayer(torch.nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size)
         self.post_attention_layernorm = RMSNorm(config.hidden_size)
 
-    def forward(self, hidden_state, mask):
+    def forward(self, hidden_state):
         res = hidden_state
         hidden_state = self.input_layernorm(hidden_state)
-        hidden_state = self.self_attn(hidden_state, mask) + res
+        hidden_state = self.self_attn(hidden_state) + res
         res = hidden_state
         hidden_state = self.post_attention_layernorm(hidden_state)
         hidden_states, gate_logit = self.moe(hidden_state)
@@ -312,9 +317,9 @@ class LlamaForCausalLM(PreTrainedModel):
         hidden_states = self.embed_tokens(input_ids)
         for idx, layer in enumerate(self.layers):
             if self.gradient_checkpointing and self.training:
-                hidden_states, gate_logit = checkpoint(layer, hidden_states, attention_mask)
+                hidden_states, gate_logit = checkpoint(layer, hidden_states)
             else:
-                hidden_states, gate_logit = layer(hidden_states, attention_mask)
+                hidden_states, gate_logit = layer(hidden_states)
             if gate_logit is not None and all_router_logits is not None:
                 all_router_logits += (gate_logit,)
 
@@ -368,16 +373,16 @@ class LlamaForCausalLM(PreTrainedModel):
 
 
 class GenerateTextCallback(TrainerCallback):
-    def __init__(self, tokenizer, prefix="我是", generate_every=500, max_new_length=50):
+    def __init__(self, tokenizer, generate_every=500, max_new_length=50):
         self.tokenizer = tokenizer
-        self.prefix = prefix
         self.generate_every = generate_every
         self.max_new_length = max_new_length
 
     def on_step_end(self, args, state: TrainerState, control: TrainerControl, model=None, **kwargs):
         if state.global_step % self.generate_every == 0:
             model.eval()
-            input_ids = self.tokenizer(self.tokenizer.bos_token + self.prefix, return_tensors="pt")["input_ids"].to(
+            prefix = ["请帮助我", "写一首", "给我一些", "你知道"]
+            input_ids = self.tokenizer(self.tokenizer.bos_token + random.choice(prefix), return_tensors="pt")["input_ids"].to(
                 model.device)
             with torch.no_grad():
                 outputs = model.generate(input_ids=input_ids, max_new_length=self.max_new_length,
@@ -388,20 +393,20 @@ class GenerateTextCallback(TrainerCallback):
 
 
 class ChatCallback(TrainerCallback):
-    def __init__(self, tokenizer, prompt="请帮我写一个关于小狗的故事", generate_every=500, max_new_length=50):
+    def __init__(self, tokenizer,  generate_every=500, max_new_length=50):
         self.tokenizer = tokenizer
-        self.prompt = prompt
         self.generate_every = generate_every
         self.max_new_length = max_new_length
 
     def on_step_end(self, args, state: TrainerState, control: TrainerControl, model=None, **kwargs):
-        messages = [{"role": 'user', "content": self.prompt}]
+        prompt = ["请帮我写一个关于小狗的故事", "给我健身建议", "介绍杭州的热门景区"]
+        messages = [{"role": 'user', "content": random.choice(prompt)}]
         new_prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
         input_ids = torch.tensor(self.tokenizer(new_prompt)['input_ids'], device=model.device).unsqueeze(0)
         if state.global_step % self.generate_every == 0:
             model.eval()
             with torch.no_grad():
-                outputs = model.generate(input_ids=input_ids, max_length=self.max_new_length,
+                outputs = model.generate(input_ids=input_ids, max_new_length=self.max_new_length,
                                          eos_token_id=self.tokenizer.eos_token_id, )
             decode = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             print(f"Step {state.global_step}: Generated text: {decode}")
