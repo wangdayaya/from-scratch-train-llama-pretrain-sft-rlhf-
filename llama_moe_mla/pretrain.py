@@ -1,5 +1,3 @@
-import random
-
 import torch
 from swanlab.integration.transformers import SwanLabCallback
 from transformers import AutoTokenizer, TrainingArguments, Trainer, DefaultDataCollator
@@ -8,9 +6,7 @@ from model.llama_moe_mla import LlamaForCausalLM, GenerateTextCallback
 from model.llama_moe_mla_config import LMConfig
 
 
-
 def main():
-
     output_dir = "llama_moe_mla_pretrain_hq_0408"
     # 加载配置
     print("加载 config")
@@ -24,7 +20,7 @@ def main():
 
     print("初始化 others")
     model = LlamaForCausalLM(config)
-    # model.load_state_dict(torch.load(r'D:\PycharmProjects\from scratch train llama\llama_moe_mla\final_model\llama_moe_mla_pretrain_hq_0330_state_dict.pth'), )
+
     print(model)
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Total number of parameters: {num_params / 1000 ** 3}B")
@@ -43,7 +39,7 @@ def main():
         do_train=True,
         # do_eval=True,
         seed=42,
-        per_device_train_batch_size=10,  # 10
+        per_device_train_batch_size=30,  # 10
         per_device_eval_batch_size=30,
         gradient_accumulation_steps=10,
         gradient_checkpointing=False,

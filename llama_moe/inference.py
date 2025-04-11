@@ -2,8 +2,8 @@ import torch
 from torch.cuda.amp import autocast
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from llama_moe_mla.model.llama_moe_mla import LlamaForCausalLM
-from llama_moe_mla.model.llama_moe_mla_config import LMConfig
+from llama_moe.model.llama_moe import LlamaForCausalLM
+from llama_moe.model.llama_moe_config import LMConfig
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # 检查是否有可用的GPU
 
@@ -17,10 +17,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # 检查�
 # config.vocab_size = len(tokenizer)
 #
 # model = LlamaForCausalLM(config)
-# model.load_state_dict(torch.load(r'D:\PycharmProjects\from scratch train llama\llama_moe_mla\final_model\llama_moe_mla_pretrain_hq_0330_state_dict.pth'), )
+# model.load_state_dict(torch.load(r'D:\PycharmProjects\from scratch train llama\llama_moe\final_model\llama_moe_pretrain_hq_0409_state_dict.pth'), )
 # model.to(device)
 # model.eval()  # 设置为评估模式
-# for s in ["给我一些写作的建议", "写一首关于小狗的诗歌", "挑选一些国内的旅游景点","给我一些健身的建议", "如何提高学习成绩"]:
+# for s in ["请帮助我","写一首","给我一些","你知道","给我一些写作的建议", "写一首关于小狗的诗歌", "挑选一些国内的旅游景点","给我一些健身的建议", "如何提高学习成绩"]:
 #     input_text = tokenizer.bos_token + s
 #     input_ids = tokenizer(input_text, return_tensors="pt")["input_ids"].to(device)  # 将输入数据移动到 GPU
 #     start = input_ids.shape[1]
@@ -42,10 +42,10 @@ tokenizer = AutoTokenizer.from_pretrained(r"D:\minimind\model\minimind_tokenizer
 config.vocab_size = len(tokenizer)
 
 model = LlamaForCausalLM(config)
-model.load_state_dict(torch.load(r'D:\PycharmProjects\from scratch train llama\llama_moe_mla\final_model\llama_moe_mla_sft_hq_0409_state_dict.pth'), )
+model.load_state_dict(torch.load(r'D:\PycharmProjects\from scratch train llama\llama_moe\final_model\llama_moe_sft_hq_0410_state_dict.pth'), )
 model.to(device)
 model.eval()  # 设置为评估模式
-for s in ["请给我一份晚上的健康饮食清单", "你知道如何炒股吗","给我一些写作的建议", "写一首关于小狗的诗歌", "挑选一些国内的旅游景点","给我一些健身的建议", "如何提高学习成绩"][:2]:
+for s in ["给我一些详细的写作练习建议", "你知道如何炒股吗", "请给我一份晚上的健康饮食清单","写一首关于小狗的诗歌", "挑选一些国内的旅游景点","给我一些健身的建议", "如何提高学习成绩"][:3]:
     messages = [{"role": 'user', "content": s}]
     new_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
     input_ids = torch.tensor(tokenizer(new_prompt)['input_ids'], device=model.device).unsqueeze(0)

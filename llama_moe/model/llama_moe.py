@@ -65,7 +65,7 @@ class LlamaAttention(torch.nn.Module):
         self.v_proj = torch.nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
         self.o_proj = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
 
-    def forward(self, hidden_state):
+    def forward(self, hidden_state, attention_mask):
         B, L, _ = hidden_state.shape
         cos, sin = llama_rotary_embedding(L, self.config)
         cos, sin = cos.to(hidden_state.device), sin.to(hidden_state.device)
@@ -97,6 +97,7 @@ class LlamaAttention(torch.nn.Module):
             mask = torch.full((1, 1, self.config.max_seq_len, self.config.max_seq_len), float("-inf"))
             mask = torch.triu(mask, diagonal=1)
             attn += mask[:, :, :L, :L].to(attn.device)
+            # attn += get_causal_mask(attention_mask)
             attn = F.softmax(attn.float(), dim=-1).type_as(q)
             attn = attn @ v
             attn = attn.transpose(1, 2).reshape(B, L, -1)
@@ -192,10 +193,10 @@ class LlamaDecoderLayer(torch.nn.Module):
         self.input_layernorm = LlamaRMSNorm(config)
         self.post_attention_layernorm = LlamaRMSNorm(config)
 
-    def forward(self, hidden_state):
+    def forward(self, hidden_state, attention_mask):
         res = hidden_state
         hidden_state = self.input_layernorm(hidden_state)
-        hidden_state = self.self_attn(hidden_state) + res
+        hidden_state = self.self_attn(hidden_state, attention_mask) + res
         res = hidden_state
         hidden_state = self.post_attention_layernorm(hidden_state)
         hidden_states, gate_logit = self.moe(hidden_state)
@@ -226,9 +227,9 @@ class LlamaForCausalLM(PreTrainedModel):
         hidden_states = self.embed_tokens(input_ids)
         for idx, layer in enumerate(self.layers):
             if self.gradient_checkpointing and self.training:
-                hidden_states, gate_logit = checkpoint(layer, hidden_states)
+                hidden_states, gate_logit = checkpoint(layer, hidden_states, attention_mask )
             else:
-                hidden_states, gate_logit = layer(hidden_states)
+                hidden_states, gate_logit = layer(hidden_states, attention_mask)
             if gate_logit is not None and all_router_logits is not None:
                 all_router_logits += (gate_logit,)
 

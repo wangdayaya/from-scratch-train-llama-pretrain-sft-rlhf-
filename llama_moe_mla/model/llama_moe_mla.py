@@ -1,12 +1,10 @@
 import math
 import random
-
-from flash_attn import flash_attn_func
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
-from transformers import PreTrainedModel, AutoTokenizer, TrainerCallback, TrainerState, TrainerControl
+from transformers import PreTrainedModel, TrainerCallback, TrainerState, TrainerControl
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
@@ -29,98 +27,23 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotate_pos_emb(q, k, cos, sin, unsqueeze_dim=2):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-
+def apply_rotary_embedding(q, k, cos, sin):
+    seq_len = q.shape[1]
+    cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(2)  # [1, seq, 1, h]
+    sin = sin[:seq_len, :].unsqueeze(0).unsqueeze(2)  # [1, seq, 1, h]
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
-
     return q_embed, k_embed
 
 
-# 旋转位置编码
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_seq_len=1024):
-        super(RotaryEmbedding, self).__init__()
-        self.dim = dim
-        self.max_seq_len = max_seq_len
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        t = torch.arange(max_seq_len).float().unsqueeze(1)
-        freqs = t @ inv_freq.unsqueeze(0)
-        freqs = torch.cat((freqs, freqs), dim=-1)
-
-        self.register_buffer("cos_cached", freqs.cos())
-        self.register_buffer("sin_cached", freqs.sin())
-
-    def forward(self, q, k):
-        cos = self.cos_cached[:q.shape[1], :].unsqueeze(0)
-        sin = self.sin_cached[:q.shape[1], :].unsqueeze(0)
-        return apply_rotate_pos_emb(q, k, cos, sin)
-
-    #
-# @torch.no_grad()
-# def llama_rotary_embedding(length, config):
-#     inv_freq = torch.arange(0, config.head_dim, 2) / config.head_dim
-#     inv_freq = 1 / (config.rope_theta ** inv_freq)
-#     inv_freq = inv_freq.reshape(config.head_dim // 2, 1)
-#
-#     position_ids = torch.arange(length).reshape(1, length).float()
-#     freq = inv_freq.matmul(position_ids).transpose(0, 1)
-#     emb = torch.cat((freq, freq), -1)
-#     return emb.cos(), emb.sin()
-#
-#
-# def apply_rotary_pos_emb(x, cos, sin, config):
-#     def rotate_half(x):
-#         left = x[..., :config.head_dim // 2]
-#         right = -x[..., config.head_dim // 2:]
-#         return torch.cat((right, left), -1)
-#
-#     return x * cos + rotate_half(x) * sin
-#
-#
-# class LlamaRMSNorm(torch.nn.Module):
-#     def __init__(self, config):
-#         super().__init__()
-#         self.rms_norm_eps = config.rms_norm_eps
-#         self.weight = torch.nn.Parameter(torch.ones(config.hidden_size))
-#
-#     def forward(self, x):
-#         var = x.pow(2).mean(-1, keepdim=True)
-#         x = x * (var + self.rms_norm_eps).rsqrt()
-#         return self.weight * x
-
-def get_causal_mask(attention_mask):
-    """
-    attention_mask = torch.tensor([
-        [1, 1, 0, 0, 0],  # 第一个序列
-        [1, 1, 1, 1, 1] ,  # 第二个序列
-    ])
-    tensor([[[[ 0.0000e+00, -1.0000e+15, -1.0000e+15, -1.0000e+15, -1.0000e+15],
-              [ 0.0000e+00,  0.0000e+00, -1.0000e+15, -1.0000e+15, -1.0000e+15],
-              [ 0.0000e+00,  0.0000e+00, -1.0000e+15, -1.0000e+15, -1.0000e+15],
-              [ 0.0000e+00,  0.0000e+00, -1.0000e+15, -1.0000e+15, -1.0000e+15],
-              [ 0.0000e+00,  0.0000e+00, -1.0000e+15, -1.0000e+15, -1.0000e+15]]],
-
-
-            [[[ 0.0000e+00, -1.0000e+15, -1.0000e+15, -1.0000e+15, -1.0000e+15],
-              [ 0.0000e+00,  0.0000e+00, -1.0000e+15, -1.0000e+15, -1.0000e+15],
-              [ 0.0000e+00,  0.0000e+00,  0.0000e+00, -1.0000e+15, -1.0000e+15],
-              [ 0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00, -1.0000e+15],
-              [ 0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00]]]])
-    :param attention_mask:
-    :return:
-    """
-    B, L = attention_mask.shape
-    min_value = -1e15
-    causal_mask = torch.full((L, L), min_value).triu(diagonal=1)
-    causal_mask = causal_mask.reshape(1, 1, L, L).repeat(B, 1, 1, 1)
-    causal_mask = causal_mask.to(attention_mask.device)
-
-    mask = attention_mask.reshape(B, 1, 1, L) == 0
-    causal_mask = causal_mask.masked_fill(mask, min_value)
-    return causal_mask
+def rotary_embedding(dim, max_seq_len=1024):
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+    t = torch.arange(max_seq_len).float()
+    freqs = t.unsqueeze(1) @ inv_freq.unsqueeze(0)
+    freqs = torch.cat((freqs, freqs), dim=-1)
+    cos = freqs.cos()
+    sin = freqs.sin()
+    return cos, sin
 
 
 class MLA(nn.Module):
@@ -148,8 +71,6 @@ class MLA(nn.Module):
 
         self.wo = nn.Linear(self.num_attention_heads * self.v_head_dim, self.hidden_size)
 
-        self.rotary_emb = RotaryEmbedding(self.qk_rope_head_dim, config.max_seq_len)  # 旋转旋转位置编码
-
     def forward(self, x):
         bs, seq_len, _ = x.shape
         q = self.wq_a(x)  # [bs, seq_len, q_lora_rank]
@@ -164,7 +85,9 @@ class MLA(nn.Module):
                                dim=-1)  # kv shape:[bs, seq_len, kv_lora_rank] k_pe shape:[bs, seq_len, qk_rope_head_dim]
 
         k_pe = k_pe.unsqueeze(2)
-        q_pe, k_pe = self.rotary_emb(q_pe, k_pe)  # [bs, seq_len, n_heads, qk_rope_head_dim]  [bs, seq_len, 1, qk_rope_head_dim]
+        cos, sin = rotary_embedding(self.qk_rope_head_dim, self.config.max_seq_len)
+        cos, sin = cos.to(x.device), sin.to(x.device)
+        q_pe, k_pe = apply_rotary_embedding(q_pe, k_pe, cos, sin)
         k_pe = k_pe.squeeze(2)  # [bs, seq_len, qk_rope_head_dim]
 
         wkv_b = self.wkv_b.weight  # [n_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank]

@@ -12,7 +12,7 @@ def main():
 
     # 加载配置
     print("加载 config")
-    config = LMConfig()
+    config = LMConfig(flash_attention=True)
 
     # 加载分词器
     print("加载 tokenzier")
@@ -42,7 +42,7 @@ def main():
         seed=42,
         per_device_train_batch_size=10,
         per_device_eval_batch_size=10,
-        gradient_accumulation_steps=4,
+        gradient_accumulation_steps=10,
         gradient_checkpointing=False,
         num_train_epochs=2,
         learning_rate=5e-4,
@@ -60,11 +60,11 @@ def main():
     )
 
     print("初始化 swanlab ")
-    swanlab_callback = SwanLabCallback(
-        project="llama_from_scratch_pretrain",
-        experiment_name=output_dir,
-        config={**config.__dict__, 'dataset': 'hq', 'train_data_num':len(train_set), 'val_data_num':len(val_set), "参数量":  f"{num_params / 1000 ** 3}B"}
-    )
+    # swanlab_callback = SwanLabCallback(
+    #     project="llama_from_scratch_pretrain",
+    #     experiment_name=output_dir,
+    #     config={**config.__dict__, 'dataset': 'hq', 'train_data_num':len(train_set), 'val_data_num':len(val_set), "参数量":  f"{num_params / 1000 ** 3}B"}
+    # )
     print("Start set Trainer............")
     trainer = Trainer(
         model=model,
@@ -74,12 +74,12 @@ def main():
         tokenizer=tokenizer,
         data_collator=DefaultDataCollator(),
         callbacks=[
-            swanlab_callback,
-            GenerateTextCallback(tokenizer, prefix="请帮我", generate_every=100, max_length=30),
+            # swanlab_callback,
+            GenerateTextCallback(tokenizer, generate_every=100, max_new_length=100),
         ]
     )
     print("Start Training...............")
-    trainer.train(resume_from_checkpoint=True)
+    trainer.train(resume_from_checkpoint=False)
     torch.save(model.state_dict(), f"llama/llama_final_models/{output_dir}_state_dict.pth")
     torch.save(model, f"llama/llama_final_models/{output_dir}.pth")
 

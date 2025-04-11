@@ -17,14 +17,14 @@ print("加载 tokenizer")
 tokenizer = AutoTokenizer.from_pretrained(r"D:\minimind\model\minimind_tokenizer")
 config.vocab_size = len(tokenizer)
 model = LlamaForCausalLM(config)
-model.load_state_dict(torch.load('llama_final_models/pretrain_hq_0325_state_dict.pth'))
-# model = torch.load('llama_final_models/pretrain_hq_0325.pth')
+model.load_state_dict(torch.load('final_models/pretrain_hq_0325_state_dict.pth'))
+# model = torch.load('final_models/pretrain_hq_0325.pth')
 model.to(device)
 model.eval()  # 设置为评估模式
 input_text = tokenizer.bos_token + "你知道物理吗？"
 input_ids = tokenizer(input_text, return_tensors="pt")["input_ids"].to(device)  # 将输入数据移动到 GPU
 model = LlamaForCausalLM(config)
-model.load_state_dict(torch.load(r'D:\PycharmProjects\from scratch train llama\llama\llama_final_models\pretrain_hq_0325_state_dict.pth'), )
+model.load_state_dict(torch.load(r'/llama/final_models\pretrain_hq_0325_state_dict.pth'), )
 model.to(device)
 model.eval()  # 设置为评估模式
 for s in ["给我一些写作的建议", "写一首关于小狗的诗歌", "挑选一些国内的旅游景点","给我一些健身的建议", "如何提高学习成绩"]:
@@ -49,7 +49,7 @@ for s in ["给我一些写作的建议", "写一首关于小狗的诗歌", "挑�
 # config.vocab_size = len(tokenizer)
 #
 # model = LlamaForCausalLM(config)
-# model.load_state_dict(torch.load(r'D:\PycharmProjects\from scratch train llama\llama\llama_final_models\sft_hq_0326_state_dict.pth'), )
+# model.load_state_dict(torch.load(r'D:\PycharmProjects\from scratch train llama\llama\final_models\sft_hq_0326_state_dict.pth'), )
 # model.to(device)
 # model.eval()  # 设置为评估模式
 # for s in ["给我一些写作的建议", "写一首关于小狗的诗歌", "挑选一些国内的旅游景点","给我一些健身的建议", "如何提高学习成绩"]:
@@ -68,8 +68,8 @@ for s in ["给我一些写作的建议", "写一首关于小狗的诗歌", "挑�
 
 # rlhf
 # model = LlamaForCausalLM(config)
-# model.load_state_dict(torch.load('llama_final_models/dpo_0326_state_dict.pth'), )
-# # model = torch.load('llama_final_models/dpo_0326.pth')
+# model.load_state_dict(torch.load('final_models/dpo_0326_state_dict.pth'), )
+# # model = torch.load('final_models/dpo_0326.pth')
 # model.to(device)
 # model.eval()  # 设置为评估模式
 # messages = [{"role": 'user', "content": "你知道如何炒股吗"}]

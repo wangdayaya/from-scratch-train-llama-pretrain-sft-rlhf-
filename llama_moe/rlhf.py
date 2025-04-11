@@ -5,8 +5,8 @@ from torch.cuda.amp import autocast
 from transformers import AutoTokenizer, TrainingArguments, Trainer
 
 from data.dataset import DPODataCollator, DPODataset
-from llama.model.llama_config import LMConfig
-from llama.model.llama import ChatCallback, LlamaForCausalLM
+from llama_moe.model.llama_moe import LlamaForCausalLM, ChatCallback
+from llama_moe.model.llama_moe_config import LMConfig
 
 
 def logits_to_probs(logits, labels):
@@ -78,9 +78,9 @@ if __name__ == '__main__':
     # 加载模型
     print("加载训练好的模型")
     model = LlamaForCausalLM(config)
-    model.load_state_dict(torch.load('final_models/sft_hq_0326_state_dict.pth'))
+    model.load_state_dict(torch.load(r'D:\PycharmProjects\from scratch train llama\llama_moe\final_model\llama_moe_sft_hq_0410_state_dict.pth'))
     ref_model = LlamaForCausalLM(config)
-    ref_model.load_state_dict(torch.load('final_models/sft_hq_0326_state_dict.pth'))
+    ref_model.load_state_dict(torch.load(r'D:\PycharmProjects\from scratch train llama\llama_moe\final_model\llama_moe_sft_hq_0410_state_dict.pth'))
     ref_model.eval()
     ref_model.to('cuda')
 
@@ -92,22 +92,22 @@ if __name__ == '__main__':
 
     # 数据
     print("Start Load Train and Validation Data...")
-    train_set = DPODataset(r"D:\minimind_dataset\dpo_val.jsonl", tokenizer, config.max_seq_len)
+    train_set = DPODataset(r"D:\minimind_dataset\dpo_train.jsonl", tokenizer, config.max_seq_len)
     val_set = DPODataset(r"D:\minimind_dataset\dpo_val.jsonl", tokenizer, config.max_seq_len)
     print(f"训练数据{len(train_set)}，验证数据{len(val_set)}")
 
     # trainer
     print("Start set TrainingArguments...")
-    output_dir = "llama_dpo_0410"
+    output_dir = "llama_moe_dpo_0411"
     training_args = TrainingArguments(
         output_dir=output_dir,
         do_train=True,
         do_eval=True,
         seed=42,
-        per_device_train_batch_size=8,
+        per_device_train_batch_size=6,
         per_device_eval_batch_size=2,
-        gradient_accumulation_steps=1,
-        gradient_checkpointing=True,
+        gradient_accumulation_steps=10,
+        gradient_checkpointing=False,
         num_train_epochs=3,
         learning_rate=5e-5,
         warmup_ratio=0.03,
@@ -125,7 +125,7 @@ if __name__ == '__main__':
 
     print("初始化 swanlab ")
     swanlab_callback = SwanLabCallback(
-        project="llama_from_scratch_dpo",
+        project="llama_moe_from_scratch_dpo",
         experiment_name=output_dir,
         config={**config.__dict__, 'dataset': '搜集合并了网上的多份数据', 'train_data_num':len(train_set), 'val_data_num':len(val_set), "参数量":  f"{num_params / 1000 ** 3}B"}
     )

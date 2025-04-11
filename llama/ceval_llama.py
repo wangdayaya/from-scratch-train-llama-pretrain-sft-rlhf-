@@ -47,7 +47,7 @@ if __name__ == '__main__':
     config = LMConfig()
     tokenizer = AutoTokenizer.from_pretrained(r"D:\minimind\model\minimind_tokenizer")
     config.vocab_size = len(tokenizer)
-    model = torch.load('llama_final_models/sft_hq_0326.pth').to(device)
+    model = torch.load('final_models/sft_hq_0326.pth').to(device)
 
     total = len(data)
     not_legal = 0

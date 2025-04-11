@@ -10,7 +10,7 @@ class LMConfig(PretrainedConfig):
             vocab_size=6400,
             max_seq_len=512,
             hidden_size=512,
-            num_hidden_layers=1,
+            num_hidden_layers=32,
             num_attention_heads=16,
             head_dim=32,
             num_key_value_heads=4,

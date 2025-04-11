@@ -1,4 +1,6 @@
 import math
+import random
+
 import torch
 import torch.nn.functional as F
 from flash_attn import flash_attn_func
@@ -195,19 +197,19 @@ class LlamaForCausalLM(PreTrainedModel):
 
 
 class GenerateTextCallback(TrainerCallback):
-    def __init__(self, tokenizer, prefix="我是", generate_every=500, max_new_length=50):
+    def __init__(self, tokenizer, generate_every=500, max_new_length=50):
         self.tokenizer = tokenizer
-        self.prefix = prefix
         self.generate_every = generate_every
         self.max_new_length = max_new_length
 
     def on_step_end(self, args, state: TrainerState, control: TrainerControl, model=None, **kwargs):
         if state.global_step % self.generate_every == 0:
             model.eval()
-            input_ids = self.tokenizer(self.tokenizer.bos_token + self.prefix, return_tensors="pt")["input_ids"].to(
+            prefix = ["请帮助我", "写一首", "给我一些", "你知道"]
+            input_ids = self.tokenizer(self.tokenizer.bos_token + random.choice(prefix), return_tensors="pt")["input_ids"].to(
                 model.device)
             with torch.no_grad():
-                outputs = model.generate(input_ids=input_ids, max_length=self.max_new_length,
+                outputs = model.generate(input_ids=input_ids, max_new_length=self.max_new_length,
                                          eos_token_id=self.tokenizer.eos_token_id, )
             decode = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             print(f"Step {state.global_step}: Generated text: {decode}")
@@ -215,20 +217,20 @@ class GenerateTextCallback(TrainerCallback):
 
 
 class ChatCallback(TrainerCallback):
-    def __init__(self, tokenizer, prompt="请帮我写一个关于小狗的故事", generate_every=500, max_new_length=50):
+    def __init__(self, tokenizer, generate_every=500, max_new_length=50):
         self.tokenizer = tokenizer
-        self.prompt = prompt
         self.generate_every = generate_every
         self.max_new_length = max_new_length
 
     def on_step_end(self, args, state: TrainerState, control: TrainerControl, model=None, **kwargs):
-        messages = [{"role": 'user', "content": self.prompt}]
+        prompt = ["请帮我写一个关于小狗的故事", "给我健身建议","介绍杭州的热门景区"]
+        messages = [{"role": 'user', "content": random.choice(prompt)}]
         new_prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
         input_ids = torch.tensor(self.tokenizer(new_prompt)['input_ids'], device=model.device).unsqueeze(0)
         if state.global_step % self.generate_every == 0:
             model.eval()
             with torch.no_grad():
-                outputs = model.generate(input_ids=input_ids, max_length=self.max_new_length,
+                outputs = model.generate(input_ids=input_ids, max_new_length=self.max_new_length,
                                          eos_token_id=self.tokenizer.eos_token_id, )
             decode = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             print(f"Step {state.global_step}: Generated text: {decode}")
